@@ -1,0 +1,184 @@
+---
+title: Stacey Laundry Hub database ERD
+---
+%% Column lengths, defaults, and complete nullability are documented in DATABASE_ERD.md.
+erDiagram
+    users {
+        int id PK "NOT NULL AUTO_INCREMENT"
+        varchar username UK "NOT NULL"
+        varchar email UK "NULL"
+        varchar password_hash "NOT NULL"
+        varchar full_name "NOT NULL"
+        enum role "NOT NULL"
+        enum status "NOT NULL DEFAULT active"
+        datetime last_login "NULL"
+        timestamp created_at "NULL, DEFAULT CURRENT_TIMESTAMP"
+        timestamp updated_at "NULL, DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"
+    }
+
+    user_remember_tokens {
+        char token_hash PK "NOT NULL"
+        int user_id FK "NOT NULL INDEX"
+        datetime expires_at "NOT NULL"
+        timestamp created_at "NULL, DEFAULT CURRENT_TIMESTAMP"
+    }
+
+    customers {
+        int id PK "NOT NULL AUTO_INCREMENT"
+        varchar full_name "NOT NULL"
+        varchar contact_number "NOT NULL"
+        text address "NOT NULL"
+        date registration_date "NOT NULL"
+        timestamp created_at "NULL, DEFAULT CURRENT_TIMESTAMP"
+        timestamp updated_at "NULL, DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"
+    }
+
+    customer_accounts {
+        int id PK "NOT NULL AUTO_INCREMENT"
+        int customer_id FK, UK "NOT NULL"
+        varchar email UK "NOT NULL"
+        varchar password_hash "NOT NULL"
+        enum account_status "NOT NULL DEFAULT active"
+        varchar profile_picture "NULL"
+        datetime last_login "NULL"
+        timestamp created_at "NULL, DEFAULT CURRENT_TIMESTAMP"
+        timestamp updated_at "NULL, DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"
+    }
+
+    customer_password_resets {
+        int id PK "NOT NULL AUTO_INCREMENT"
+        int customer_account_id FK "NOT NULL INDEX"
+        char token_hash UK "NOT NULL"
+        datetime expires_at "NOT NULL"
+        datetime used_at "NULL"
+        timestamp created_at "NULL, DEFAULT CURRENT_TIMESTAMP"
+    }
+
+    services {
+        int id PK "NOT NULL AUTO_INCREMENT"
+        varchar name "NOT NULL"
+        decimal price "NOT NULL"
+        varchar unit "NOT NULL"
+        enum status "NOT NULL DEFAULT active"
+        timestamp created_at "NULL, DEFAULT CURRENT_TIMESTAMP"
+        timestamp updated_at "NULL, DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"
+    }
+
+    orders {
+        int id PK "NOT NULL AUTO_INCREMENT"
+        varchar order_number UK "NOT NULL"
+        int customer_id FK "NOT NULL"
+        varchar status "NOT NULL DEFAULT Received"
+        decimal weight_kg "NOT NULL DEFAULT 0"
+        int quantity "NOT NULL DEFAULT 1"
+        decimal subtotal "NOT NULL DEFAULT 0"
+        decimal discount "NOT NULL DEFAULT 0"
+        decimal total "NOT NULL DEFAULT 0"
+        text special_instructions "NULL"
+        date estimated_completion "NULL"
+        int created_by FK "NULL"
+        timestamp created_at "NULL, DEFAULT CURRENT_TIMESTAMP"
+        timestamp updated_at "NULL, DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"
+    }
+
+    order_items {
+        int id PK "NOT NULL AUTO_INCREMENT"
+        int order_id FK "NOT NULL"
+        int service_id FK "NOT NULL"
+        int quantity "NOT NULL DEFAULT 1"
+        decimal unit_price "NOT NULL"
+        decimal line_total "NOT NULL"
+    }
+
+    order_status_history {
+        int id PK "NOT NULL AUTO_INCREMENT"
+        int order_id FK "NOT NULL"
+        varchar old_status "NOT NULL"
+        varchar new_status "NOT NULL"
+        int changed_by FK "NOT NULL"
+        timestamp changed_at "NULL, DEFAULT CURRENT_TIMESTAMP"
+        text notes "NULL"
+    }
+
+    payments {
+        int id PK "NOT NULL AUTO_INCREMENT"
+        int order_id FK "NOT NULL"
+        decimal amount "NOT NULL"
+        varchar payment_method "NOT NULL"
+        datetime payment_date "NOT NULL DEFAULT CURRENT_TIMESTAMP"
+        varchar notes "NULL"
+        int created_by FK "NULL"
+        timestamp created_at "NULL, DEFAULT CURRENT_TIMESTAMP"
+    }
+
+    notifications {
+        int id PK "NOT NULL AUTO_INCREMENT"
+        int customer_id FK "NOT NULL"
+        varchar title "NOT NULL"
+        text message "NOT NULL"
+        varchar type "NOT NULL DEFAULT in_system"
+        tinyint is_read "NOT NULL DEFAULT 0"
+        timestamp created_at "NULL, DEFAULT CURRENT_TIMESTAMP"
+    }
+
+    activity_logs {
+        int id PK "NOT NULL AUTO_INCREMENT"
+        int user_id FK "NULL"
+        varchar action "NOT NULL"
+        text details "NULL"
+        timestamp created_at "NULL, DEFAULT CURRENT_TIMESTAMP"
+    }
+
+    customer_notifications {
+        int id PK "NOT NULL AUTO_INCREMENT"
+        int customer_id FK "NULL"
+        int order_id FK "NULL"
+        varchar title "NOT NULL"
+        text message "NOT NULL"
+        enum notification_type "NOT NULL DEFAULT order"
+        tinyint is_read "NOT NULL DEFAULT 0"
+        timestamp created_at "NULL, DEFAULT CURRENT_TIMESTAMP"
+    }
+
+    customer_notification_reads {
+        int notification_id PK, FK "NOT NULL"
+        int customer_id PK, FK "NOT NULL"
+        timestamp read_at "NULL, DEFAULT CURRENT_TIMESTAMP"
+    }
+
+    customer_support_messages {
+        int id PK "NOT NULL AUTO_INCREMENT"
+        int customer_id FK "NOT NULL"
+        int order_id FK "NULL"
+        varchar subject "NOT NULL"
+        text message "NOT NULL"
+        enum status "NOT NULL DEFAULT open"
+        text staff_reply "NULL"
+        int replied_by FK "NULL"
+        datetime replied_at "NULL"
+        timestamp created_at "NULL, DEFAULT CURRENT_TIMESTAMP"
+    }
+
+    users ||--o{ user_remember_tokens : "1:N"
+    users o|--o{ activity_logs : "optional user"
+    users o|--o{ orders : "optional creator"
+    users ||--o{ order_status_history : "1:N changed by"
+    users o|--o{ payments : "optional creator"
+    users o|--o{ customer_support_messages : "optional responder"
+
+    customers ||--o{ orders : "1:N"
+    customers ||--o{ notifications : "1:N legacy"
+    customers ||--o| customer_accounts : "1:0..1"
+    customers o|--o{ customer_notifications : "optional recipient"
+    customers ||--o{ customer_notification_reads : "1:N reads"
+    customers ||--o{ customer_support_messages : "1:N"
+
+    customer_accounts ||--o{ customer_password_resets : "1:N"
+    customer_notifications ||--o{ customer_notification_reads : "1:N reads"
+
+    orders ||--o{ order_items : "1:N"
+    orders ||--o{ order_status_history : "1:N"
+    orders ||--o{ payments : "1:N"
+    orders o|--o{ customer_notifications : "optional order"
+    orders o|--o{ customer_support_messages : "optional order"
+    services ||--o{ order_items : "1:N"

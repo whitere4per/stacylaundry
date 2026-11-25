@@ -1,0 +1,585 @@
+<?php
+require_once __DIR__ . '/config.php';
+require_once __DIR__ . '/../../app/bootstrap.php';
+
+function db(): PDO {
+    static $pdo = null;
+    if ($pdo === null) {
+        $pdo = new PDO('mysql:host=' . DB_HOST . ';port=' . DB_PORT . ';dbname=' . DB_NAME . ';charset=utf8mb4', DB_USER, DB_PASS, [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        ]);
+    }
+    return $pdo;
+}
+
+function currentUser(): ?array {
+    return $_SESSION['user'] ?? null;
+}
+
+function isHttps(): bool {
+    return (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+        || (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower($_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https')
+        || (isset($_SERVER['HTTP_CF_VISITOR']) && strpos($_SERVER['HTTP_CF_VISITOR'], '"scheme":"https"') !== false);
+}
+
+function rememberCookiePath(): string {
+    $scriptDirectory = str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'] ?? '/'));
+    return rtrim($scriptDirectory, '/') . '/';
+}
+
+function setRememberCookie(string $token, int $expiresAt): void {
+    setcookie('stacey_remember', $token, [
+        'expires' => $expiresAt,
+        'path' => rememberCookiePath(),
+        'secure' => isHttps(),
+        'httponly' => true,
+        'samesite' => 'Lax',
+    ]);
+}
+
+function clearRememberCookie(?PDO $pdo = null): void {
+    $token = $_COOKIE['stacey_remember'] ?? '';
+    if ($pdo && is_string($token) && preg_match('/^[a-f0-9]{64}$/', $token)) {
+        $stmt = $pdo->prepare('DELETE FROM user_remember_tokens WHERE token_hash = ?');
+        $stmt->execute([hash('sha256', $token)]);
+    }
+
+    setRememberCookie('', time() - 3600);
+    unset($_COOKIE['stacey_remember']);
+}
+
+function createRememberToken(PDO $pdo, int $userId): array {
+    $token = bin2hex(random_bytes(32));
+    $expiresAt = time() + (30 * 24 * 60 * 60);
+    $stmt = $pdo->prepare('INSERT INTO user_remember_tokens (user_id, token_hash, expires_at) VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 30 DAY))');
+    $stmt->execute([$userId, hash('sha256', $token)]);
+    return [$token, $expiresAt];
+}
+
+function restoreRememberedUser(): bool {
+    $token = $_COOKIE['stacey_remember'] ?? '';
+    if (!is_string($token) || !preg_match('/^[a-f0-9]{64}$/', $token)) {
+        if ($token !== '') {
+            clearRememberCookie();
+        }
+        return false;
+    }
+
+    $pdo = db();
+    $pdo->beginTransaction();
+    try {
+        $stmt = $pdo->prepare(
+            'SELECT u.id, u.username, u.full_name, u.role, u.status, r.expires_at
+             FROM user_remember_tokens r
+             JOIN users u ON u.id = r.user_id
+             WHERE r.token_hash = ? AND r.expires_at > NOW()
+             LIMIT 1 FOR UPDATE'
+        );
+        $stmt->execute([hash('sha256', $token)]);
+        $user = $stmt->fetch();
+        if (!$user || $user['status'] !== 'active') {
+            $delete = $pdo->prepare('DELETE FROM user_remember_tokens WHERE token_hash = ?');
+            $delete->execute([hash('sha256', $token)]);
+            if ($user) {
+                logActivity($pdo, 'Remembered login blocked', 'Inactive account: ' . $user['username'], (int) $user['id']);
+            }
+            $pdo->commit();
+            clearRememberCookie();
+            return false;
+        }
+
+        $delete = $pdo->prepare('DELETE FROM user_remember_tokens WHERE token_hash = ?');
+        $delete->execute([hash('sha256', $token)]);
+        [$replacementToken, $expiresAt] = createRememberToken($pdo, (int) $user['id']);
+        logActivity($pdo, 'Remembered session restored', 'User: ' . $user['username'], (int) $user['id']);
+        $pdo->commit();
+
+        session_regenerate_id(true);
+        unset($user['status'], $user['expires_at']);
+        $_SESSION['user'] = $user;
+        setRememberCookie($replacementToken, $expiresAt);
+        return true;
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $e;
+    }
+}
+
+function ensureLogin(): void {
+    if (empty($_SESSION['user']['id'])) {
+        if (restoreRememberedUser()) {
+            return;
+        }
+        bootMessage('information', 'Your session has ended. Please sign in again.');
+        redirect('login.php');
+    }
+
+    $stmt = db()->prepare('SELECT status, role, full_name, username FROM users WHERE id = ? LIMIT 1');
+    $stmt->execute([$_SESSION['user']['id']]);
+    $user = $stmt->fetch();
+    if (!$user || $user['status'] !== 'active') {
+        unset($_SESSION['user']);
+        bootMessage('error', 'Your account is no longer active. Contact an administrator.');
+        redirect('login.php');
+    }
+
+    $_SESSION['user'] = array_merge($_SESSION['user'], $user);
+}
+
+function ensureRole(array $allowed): void {
+    $user = currentUser();
+    if (!$user || !in_array($user['role'], $allowed, true)) {
+        http_response_code(403);
+        renderLayout('Access denied', '', '<div class="empty-state"><h3>You do not have permission to access this page.</h3><p>Return to the dashboard or contact an administrator if you need access.</p><a class="btn" href="index.php">Go to dashboard</a></div>');
+        exit;
+    }
+}
+
+function csrfToken(): string {
+    if (empty($_SESSION['csrf'])) {
+        $_SESSION['csrf'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['csrf'];
+}
+
+function verifyCsrf(): void {
+    if (!hash_equals($_SESSION['csrf'] ?? '', $_POST['csrf'] ?? '')) {
+        throw new InvalidArgumentException('Your session security token expired. Refresh the page and try again.');
+    }
+}
+
+function issueFormToken(string $key): string {
+    if (empty($_SESSION['form_tokens'][$key])) {
+        $_SESSION['form_tokens'][$key] = bin2hex(random_bytes(24));
+    }
+    return $_SESSION['form_tokens'][$key];
+}
+
+function verifyFormToken(string $key): void {
+    $submitted = safePost('request_token');
+    $expected = $_SESSION['form_tokens'][$key] ?? '';
+    if ($expected === '' || $submitted === '' || !hash_equals($expected, $submitted)) {
+        throw new InvalidArgumentException('This form was already submitted or has expired. Refresh the page before trying again.');
+    }
+}
+
+function rotateFormToken(string $key): void {
+    $_SESSION['form_tokens'][$key] = bin2hex(random_bytes(24));
+}
+
+function preserveFormInput(string $key, array $fieldNames): void {
+    $values = [];
+    foreach ($fieldNames as $fieldName) {
+        if (isset($_POST[$fieldName]) && is_scalar($_POST[$fieldName])) {
+            $values[$fieldName] = trim((string) $_POST[$fieldName]);
+        }
+    }
+    $_SESSION['old_form_input'][$key] = $values;
+}
+
+function takeFormInput(string $key): array {
+    $values = $_SESSION['old_form_input'][$key] ?? [];
+    unset($_SESSION['old_form_input'][$key]);
+    return is_array($values) ? $values : [];
+}
+
+function logActivity(PDO $pdo, string $action, string $details = '', ?int $actorId = null): void {
+    $stmt = $pdo->prepare('INSERT INTO activity_logs (user_id, action, details) VALUES (?, ?, ?)');
+    $stmt->execute([$actorId ?? (currentUser()['id'] ?? null), $action, $details]);
+}
+
+function notifyCustomer(PDO $pdo, ?int $customerId, ?int $orderId, string $title, string $message, string $type = 'order'): void {
+    if (!in_array($type, ['order', 'payment', 'general'], true)) {
+        $type = 'order';
+    }
+    $stmt = $pdo->prepare('INSERT INTO customer_notifications (customer_id, order_id, title, message, notification_type, is_read) VALUES (?, ?, ?, ?, ?, 0)');
+    $stmt->execute([$customerId, $orderId, $title, $message, $type]);
+}
+
+function renderToastNotifications(array $notifications): void {
+    $icons = ['success' => '✓', 'error' => '!', 'warning' => '⚠', 'information' => 'i'];
+    ?>
+    <div class="toast-region" aria-live="polite" aria-relevant="additions text" aria-label="Notifications">
+      <?php foreach ($notifications as $notification):
+          $type = in_array($notification['type'] ?? '', ['success', 'error', 'warning', 'information'], true)
+              ? $notification['type']
+              : 'information';
+          $critical = !empty($notification['critical']);
+      ?>
+        <div class="toast toast-<?= h($type) ?>" role="<?= $critical ? 'alert' : 'status' ?>" data-critical="<?= $critical ? 'true' : 'false' ?>">
+          <span class="toast-icon" aria-hidden="true"><?= h($icons[$type]) ?></span>
+          <p><?= h((string) ($notification['message'] ?? '')) ?></p>
+          <button type="button" class="toast-close" aria-label="Dismiss notification">×</button>
+        </div>
+      <?php endforeach; ?>
+    </div>
+    <?php
+}
+
+function statusClass(string $status): string {
+    $map = [
+        'Received' => 'status-received',
+        'Washing' => 'status-washing',
+        'Drying' => 'status-drying',
+        'Folding' => 'status-folding',
+        'Ready for Pickup' => 'status-ready',
+        'Picked Up' => 'status-picked',
+        'Cancelled' => 'status-cancelled',
+    ];
+    return $map[$status] ?? 'status-received';
+}
+
+function renderLayout(string $title, string $activePage, string $content): void {
+    $user = currentUser();
+    $notifications = flash();
+    ?>
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title><?= h($title) ?> | <?= h(APP_NAME) ?></title>
+      <link rel="stylesheet" href="../../public/assets/css/style.css">
+    </head>
+    <body>
+      <div class="layout">
+        <aside class="sidebar">
+          <a class="system-brand" href="index.php?page=dashboard" aria-label="Stacey Laundry Hub dashboard">
+            <span class="system-brand-mark" aria-hidden="true"><span></span></span>
+            <span class="system-brand-name">Stacey <strong>Laundry Hub</strong></span>
+          </a>
+          <button type="button" class="system-sidebar-collapse" aria-label="Collapse sidebar" aria-pressed="false">‹</button>
+          <nav class="nav">
+            <a class="<?= $activePage === 'dashboard' ? 'active' : '' ?>" href="index.php?page=dashboard"><span class="nav-icon" aria-hidden="true">D</span><span>Dashboard</span></a>
+            <a class="<?= $activePage === 'customers' ? 'active' : '' ?>" href="index.php?page=customers"><span class="nav-icon" aria-hidden="true">C</span><span>Customers</span></a>
+            <a class="<?= $activePage === 'orders' ? 'active' : '' ?>" href="index.php?page=orders"><span class="nav-icon" aria-hidden="true">O</span><span>Orders</span></a>
+            <a class="<?= $activePage === 'payments' ? 'active' : '' ?>" href="index.php?page=payments"><span class="nav-icon" aria-hidden="true">P</span><span>Payments</span></a>
+            <a class="<?= $activePage === 'notifications' ? 'active' : '' ?>" href="index.php?page=notifications"><span class="nav-icon" aria-hidden="true">N</span><span>Notifications</span></a>
+            <a class="<?= $activePage === 'reports' ? 'active' : '' ?>" href="index.php?page=reports"><span class="nav-icon" aria-hidden="true">R</span><span>Reports</span></a>
+          </nav>
+          <div class="sidebar-user">
+            <span class="sidebar-user-avatar" aria-hidden="true"><?= h(strtoupper(substr((string) ($user['full_name'] ?? 'A'), 0, 1))) ?></span>
+            <span class="sidebar-user-copy">
+              <strong><?= h((string) ($user['full_name'] ?? 'Administrator')) ?></strong>
+              <small><?= h((string) ($user['role'] ?? 'Administrator')) ?></small>
+            </span>
+            <a href="logout.php" class="sidebar-logout confirm-action" data-confirm-title="Log Out?" data-confirm="Are you sure you want to log out of your account?" data-confirm-label="Yes, Log Out" aria-label="Log out">X</a>
+          </div>
+        </aside>
+        <main class="main">
+          <header class="system-topbar">
+            <button type="button" class="sidebar-toggle" aria-label="Toggle navigation" aria-expanded="true">Menu</button>
+            <span class="system-section"><?= h($title) ?></span>
+            <span class="system-status"><span></span> Operations online</span>
+          </header>
+          <div class="content-card">
+            <?= $content ?>
+          </div>
+        </main>
+      </div>
+      <?php renderToastNotifications($notifications); ?>
+      <div class="confirm-overlay" hidden>
+        <section class="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-message">
+          <div class="confirm-icon" aria-hidden="true">!</div>
+          <h2 id="confirm-title">Confirm action</h2>
+          <p id="confirm-message"></p>
+          <div class="confirm-actions">
+            <button type="button" class="confirm-cancel">Cancel</button>
+            <button type="button" class="confirm-accept">Confirm</button>
+          </div>
+        </section>
+      </div>
+      <script>
+        document.addEventListener('DOMContentLoaded', function () {
+          const sidebarToggle = document.querySelector('.sidebar-toggle');
+          const sidebarCollapse = document.querySelector('.system-sidebar-collapse');
+          if (sidebarCollapse) {
+            sidebarCollapse.addEventListener('click', function () {
+              const collapsed = document.body.classList.toggle('system-sidebar-collapsed');
+              sidebarCollapse.setAttribute('aria-pressed', collapsed ? 'true' : 'false');
+              sidebarCollapse.setAttribute('aria-label', collapsed ? 'Expand sidebar' : 'Collapse sidebar');
+              sidebarCollapse.textContent = collapsed ? '›' : '‹';
+            });
+          }
+          if (sidebarToggle) {
+            sidebarToggle.addEventListener('click', function () {
+              const isOpen = document.body.classList.toggle('nav-open');
+              sidebarToggle.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+            });
+          }
+          document.querySelectorAll('.sidebar .nav a').forEach(function (link) {
+            link.addEventListener('click', function () {
+              document.body.classList.remove('nav-open');
+              if (sidebarToggle) sidebarToggle.setAttribute('aria-expanded', 'false');
+            });
+          });
+          const region = document.querySelector('.toast-region');
+          if (region) {
+            region.querySelectorAll('.toast').forEach(function (toast) {
+              const close = toast.querySelector('.toast-close');
+              close.addEventListener('click', function () { toast.remove(); });
+              if (toast.dataset.critical !== 'true') {
+                window.setTimeout(function () { toast.classList.add('toast-leaving'); window.setTimeout(function () { toast.remove(); }, 220); }, 5000);
+              }
+            });
+          }
+
+          const overlay = document.querySelector('.confirm-overlay');
+          let pendingForm = null;
+          let pendingLink = null;
+          const cancelButton = overlay.querySelector('.confirm-cancel');
+          const acceptButton = overlay.querySelector('.confirm-accept');
+          let previousFocus = null;
+          const closeDialog = function () {
+            overlay.hidden = true;
+            document.body.classList.remove('dialog-open');
+            pendingForm = null;
+            pendingLink = null;
+            acceptButton.disabled = false;
+            acceptButton.textContent = 'Confirm';
+            if (previousFocus) previousFocus.focus();
+          };
+          const openDialog = function (message, destructive, title, confirmLabel, variant) {
+            previousFocus = document.activeElement;
+            overlay.querySelector('#confirm-message').textContent = message;
+            overlay.querySelector('#confirm-title').textContent = title || 'Confirm action';
+            acceptButton.textContent = confirmLabel || 'Confirm';
+            const icon = overlay.querySelector('.confirm-icon');
+            icon.textContent = variant === 'financial' ? '₱' : (variant === 'success' ? '✓' : (destructive ? '!' : 'i'));
+            acceptButton.classList.toggle('destructive', destructive);
+            if (icon) icon.classList.toggle('destructive', destructive);
+            overlay.hidden = false;
+            document.body.classList.add('dialog-open');
+            cancelButton.focus();
+          };
+          document.addEventListener('click', function (event) {
+            const link = event.target.closest('.confirm-action');
+            if (!link) return;
+            event.preventDefault();
+            pendingLink = link;
+            const hasUnsavedChanges = Array.from(document.querySelectorAll('form')).some(function (form) {
+              return form.dataset.dirty === 'true' && form.dataset.submitting !== 'true';
+            });
+            const message = hasUnsavedChanges
+              ? 'You have unsaved changes. Logging out will discard them. Do you want to continue?'
+              : (link.dataset.confirm || 'Continue with this action?');
+            openDialog(
+              hasUnsavedChanges ? 'You have unsaved changes. Do you want to leave without saving?' : (link.dataset.confirm || 'Continue with this action?'),
+              hasUnsavedChanges || link.dataset.destructive === 'true',
+              hasUnsavedChanges ? 'Unsaved Changes' : (link.dataset.confirmTitle || 'Confirm action'),
+              hasUnsavedChanges ? 'Discard Changes' : (link.dataset.confirmLabel || 'Confirm'),
+              link.dataset.confirmType || 'informational'
+            );
+          });
+          cancelButton.addEventListener('click', closeDialog);
+          overlay.addEventListener('click', function (event) {
+            if (event.target === overlay) closeDialog();
+          });
+          document.addEventListener('keydown', function (event) {
+            if (event.key === 'Escape' && !overlay.hidden) closeDialog();
+            if (event.key === 'Tab' && !overlay.hidden) {
+              const focusable = [cancelButton, acceptButton];
+              const first = focusable[0];
+              const last = focusable[focusable.length - 1];
+              if (event.shiftKey && document.activeElement === first) {
+                event.preventDefault();
+                last.focus();
+              } else if (!event.shiftKey && document.activeElement === last) {
+                event.preventDefault();
+                first.focus();
+              }
+            }
+          });
+          acceptButton.addEventListener('click', function () {
+            acceptButton.disabled = true;
+            acceptButton.textContent = 'Processing...';
+            if (pendingForm) {
+              const form = pendingForm;
+              form.dataset.confirmed = 'true';
+              closeDialog();
+              form.requestSubmit();
+              return;
+            }
+            if (pendingLink) {
+              const href = pendingLink.href;
+              closeDialog();
+              window.location.assign(href);
+            }
+          });
+
+          window.addEventListener('beforeunload', function (event) {
+            if (Array.from(document.querySelectorAll('form')).some(function (form) {
+              return form.dataset.dirty === 'true' && form.dataset.submitting !== 'true';
+            })) {
+              event.preventDefault();
+              event.returnValue = '';
+            }
+          });
+
+          document.addEventListener('click', function (event) {
+            const link = event.target.closest('a[href]');
+            if (!link || link.classList.contains('confirm-action') || link.hostname !== window.location.hostname) return;
+            if (!Array.from(document.querySelectorAll('form')).some(function (form) {
+              return form.dataset.dirty === 'true' && form.dataset.submitting !== 'true';
+            })) return;
+            event.preventDefault();
+            pendingLink = link;
+            openDialog(
+              'You have unsaved changes. Do you want to leave without saving?',
+              false,
+              'Unsaved Changes',
+              'Discard Changes',
+              'warning'
+            );
+          });
+
+          document.querySelectorAll('form').forEach(function (form) {
+            form.noValidate = true;
+            const validateForm = function () {
+              let valid = true;
+              form.querySelectorAll('input, select, textarea').forEach(function (field) {
+                if (field.type === 'hidden' || field.disabled) return;
+                let message = '';
+                if (field.validity.valueMissing) {
+                  message = field.dataset.errorMessage || 'This field is required.';
+                } else if (field.validity.typeMismatch) {
+                  message = 'Enter a valid ' + (field.type === 'email' ? 'email address.' : 'value.');
+                } else if (field.validity.rangeUnderflow || field.validity.rangeOverflow || field.validity.stepMismatch) {
+                  message = field.dataset.errorMessage || 'Enter a valid value within the allowed range.';
+                } else if (field.type === 'tel' && field.value !== '' && (!/^[0-9+() -]{7,30}$/.test(field.value) || !/\d/.test(field.value))) {
+                  message = field.dataset.errorMessage || 'Enter a valid phone number.';
+                } else if (field.validity.badInput || field.validity.patternMismatch) {
+                  message = field.dataset.errorMessage || 'Enter a valid value.';
+                }
+                let error = field.parentElement.querySelector('.field-error[data-for="' + field.name + '"]');
+                if (message) {
+                  valid = false;
+                  field.setAttribute('aria-invalid', 'true');
+                  if (!error) {
+                    error = document.createElement('span');
+                    error.className = 'field-error';
+                    error.dataset.for = field.name;
+                    error.id = 'validation-' + Math.random().toString(36).slice(2);
+                    field.parentElement.appendChild(error);
+                  }
+                  error.textContent = message;
+                  field.setAttribute('aria-describedby', error.id);
+                } else {
+                  field.removeAttribute('aria-invalid');
+                  field.removeAttribute('aria-describedby');
+                  if (error) error.remove();
+                }
+              });
+              if (form.classList.contains('report-filter')) {
+                const from = form.querySelector('[name="from"]');
+                const to = form.querySelector('[name="to"]');
+                if (from && to && from.value && to.value && from.value > to.value) {
+                  valid = false;
+                  to.setAttribute('aria-invalid', 'true');
+                  let error = to.parentElement.querySelector('.field-error[data-for="to"]');
+                  if (!error) {
+                    error = document.createElement('span');
+                    error.className = 'field-error';
+                    error.dataset.for = 'to';
+                    error.id = 'validation-' + Math.random().toString(36).slice(2);
+                    to.parentElement.appendChild(error);
+                  }
+                  error.textContent = 'The end date must be on or after the start date.';
+                  to.setAttribute('aria-describedby', error.id);
+                } else if (to) {
+                  to.removeAttribute('aria-invalid');
+                  to.removeAttribute('aria-describedby');
+                  const error = to.parentElement.querySelector('.field-error[data-for="to"]');
+                  if (error) error.remove();
+                }
+              }
+              return valid;
+            };
+            form.addEventListener('input', validateForm);
+            form.addEventListener('change', validateForm);
+            form.addEventListener('input', function () { form.dataset.dirty = 'true'; });
+            form.addEventListener('change', function () { form.dataset.dirty = 'true'; });
+            form.addEventListener('submit', function (event) {
+              if (!validateForm()) {
+                event.preventDefault();
+                form.classList.add('show-validation');
+                const invalidField = form.querySelector('[aria-invalid="true"]');
+                if (invalidField) invalidField.focus();
+                return;
+              }
+              if (form.classList.contains('order-status-form') && form.dataset.confirmed !== 'true') {
+                const nextStatus = form.querySelector('[name="status"]').value;
+                if (nextStatus === 'Cancelled' || nextStatus === 'Picked Up') {
+                  event.preventDefault();
+                  pendingForm = form;
+                  const orderNumber = form.dataset.orderNumber || 'this order';
+                  const consequence = nextStatus === 'Cancelled'
+                    ? 'This order will stop moving through the laundry workflow.'
+                    : 'This will mark the order as handed back to the customer.';
+                  openDialog(
+                    'Change ' + orderNumber + ' to ' + nextStatus + '? ' + consequence,
+                    nextStatus === 'Cancelled',
+                    nextStatus === 'Cancelled' ? 'Cancel Laundry Order?' : 'Mark Ready for Pickup?',
+                    nextStatus === 'Cancelled' ? 'Cancel Order' : 'Confirm Status',
+                    nextStatus === 'Cancelled' ? 'destructive' : 'success'
+                  );
+                  return;
+                }
+              } else if (form.classList.contains('confirm-form') && form.dataset.confirmed !== 'true') {
+                event.preventDefault();
+                pendingForm = form;
+                let message = form.dataset.confirm || 'Continue with this action?';
+                if (form.classList.contains('payment-form')) {
+                  const orderSelect = form.querySelector('[name="order_id"]');
+                  const amount = form.querySelector('[name="amount"]').value;
+                  const selectedOption = orderSelect.options[orderSelect.selectedIndex];
+                  const orderName = selectedOption ? selectedOption.textContent.trim().split(' - ')[0] : 'the selected order';
+                  message = 'Record the payment of ₱' + amount + ' for order ' + orderName + '? This will update its outstanding balance.';
+                }
+                openDialog(
+                  message,
+                  form.dataset.destructive === 'true',
+                  form.dataset.confirmTitle || 'Confirm action',
+                  form.dataset.confirmLabel || 'Confirm',
+                  form.classList.contains('payment-form') ? 'financial' : (form.dataset.confirmType || 'informational')
+                );
+                return;
+              }
+              if (form.dataset.submitting === 'true') {
+                event.preventDefault();
+                return;
+              }
+              form.dataset.submitting = 'true';
+              const button = form.querySelector('button[type="submit"], button:not([type])');
+              if (button) {
+                button.dataset.originalLabel = button.textContent;
+                button.textContent = button.dataset.loadingLabel || 'Saving...';
+                button.disabled = true;
+              }
+            });
+          });
+
+          document.querySelectorAll('form.order-form').forEach(function (form) {
+            const customer = form.querySelector('[name="customer_id"]');
+            const newFields = ['new_full_name', 'new_contact_number', 'new_address'].map(function (name) {
+              return form.querySelector('[name="' + name + '"]');
+            });
+            const updateNewCustomerFields = function () {
+              const isNew = customer.value === '0';
+              newFields.forEach(function (field) {
+                field.required = isNew;
+                field.disabled = !isNew;
+              });
+            };
+            customer.addEventListener('change', updateNewCustomerFields);
+            updateNewCustomerFields();
+          });
+        });
+      </script>
+    </body>
+  </html>
+    <?php
+}

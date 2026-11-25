@@ -1,0 +1,116 @@
+CREATE TABLE IF NOT EXISTS users (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  username VARCHAR(50) NOT NULL UNIQUE,
+  email VARCHAR(254) NULL UNIQUE,
+  password_hash VARCHAR(255) NOT NULL,
+  full_name VARCHAR(100) NOT NULL,
+  role ENUM('Administrator','Staff') NOT NULL,
+  status ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  last_login DATETIME NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS user_remember_tokens (
+  token_hash CHAR(64) PRIMARY KEY,
+  user_id INT NOT NULL,
+  expires_at DATETIME NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_remember_tokens_user_expiry (user_id, expires_at),
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS customers (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  full_name VARCHAR(120) NOT NULL,
+  contact_number VARCHAR(30) NOT NULL,
+  address TEXT NOT NULL,
+  registration_date DATE NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS services (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(100) NOT NULL,
+  price DECIMAL(10,2) NOT NULL,
+  unit VARCHAR(20) NOT NULL,
+  status ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS orders (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  order_number VARCHAR(30) NOT NULL UNIQUE,
+  customer_id INT NOT NULL,
+  status VARCHAR(30) NOT NULL DEFAULT 'Received',
+  weight_kg DECIMAL(10,2) NOT NULL DEFAULT 0,
+  quantity INT NOT NULL DEFAULT 1,
+  subtotal DECIMAL(10,2) NOT NULL DEFAULT 0,
+  discount DECIMAL(10,2) NOT NULL DEFAULT 0,
+  total DECIMAL(10,2) NOT NULL DEFAULT 0,
+  special_instructions TEXT NULL,
+  estimated_completion DATE NULL,
+  created_by INT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (customer_id) REFERENCES customers(id),
+  FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS order_items (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  order_id INT NOT NULL,
+  service_id INT NOT NULL,
+  quantity INT NOT NULL DEFAULT 1,
+  unit_price DECIMAL(10,2) NOT NULL,
+  line_total DECIMAL(10,2) NOT NULL,
+  FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE,
+  FOREIGN KEY (service_id) REFERENCES services(id)
+);
+
+CREATE TABLE IF NOT EXISTS order_status_history (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  order_id INT NOT NULL,
+  old_status VARCHAR(30) NOT NULL,
+  new_status VARCHAR(30) NOT NULL,
+  changed_by INT NOT NULL,
+  changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  notes TEXT NULL,
+  FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE,
+  FOREIGN KEY (changed_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS payments (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  order_id INT NOT NULL,
+  amount DECIMAL(10,2) NOT NULL,
+  payment_method VARCHAR(50) NOT NULL,
+  payment_date DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  notes VARCHAR(255) NULL,
+  created_by INT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (order_id) REFERENCES orders(id),
+  FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS notifications (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  customer_id INT NOT NULL,
+  title VARCHAR(100) NOT NULL,
+  message TEXT NOT NULL,
+  type VARCHAR(30) NOT NULL DEFAULT 'in_system',
+  is_read TINYINT(1) NOT NULL DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (customer_id) REFERENCES customers(id)
+);
+
+CREATE TABLE IF NOT EXISTS activity_logs (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NULL,
+  action VARCHAR(150) NOT NULL,
+  details TEXT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id)
+);
